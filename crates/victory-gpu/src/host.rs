@@ -296,6 +296,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::windowup::trim_idle();
 }
 
 /// Drops `object` once every submission running now has finished: at once
