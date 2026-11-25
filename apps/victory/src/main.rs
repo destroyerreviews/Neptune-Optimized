@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 mod run;
@@ -190,26 +191,6 @@ enum Console {
     SeriesS,
 }
 
-/// (Neptune) Diagnostics builds: the redistributable D3D12 runtime and debug layer in `D3D12\`
-/// beside the executable are used if they are there (`build.rs` exports these two; the
-/// version is the middle number of the package's, 1.620.2).
-#[cfg(all(windows, feature = "diagnostics"))]
-#[unsafe(no_mangle)]
-#[used]
-pub static D3D12SDKVersion: u32 = 620;
-
-#[cfg(all(windows, feature = "diagnostics"))]
-#[repr(transparent)]
-pub struct SdkPath(*const u8);
-// SAFETY: a pointer to a constant string.
-#[cfg(all(windows, feature = "diagnostics"))]
-unsafe impl Sync for SdkPath {}
-
-#[cfg(all(windows, feature = "diagnostics"))]
-#[unsafe(no_mangle)]
-#[used]
-pub static D3D12SDKPath: SdkPath = SdkPath(b".\\D3D12\\\0".as_ptr());
-
 fn main() -> Result<()> {
     // `VICTORY_HEAP_COUNT=1`: the Rust heap's live bytes for the resident line (off: it slowed loading).
     victory_core::heapcount::enable(std::env::var_os("VICTORY_HEAP_COUNT").is_some_and(|v| v == "1"));
@@ -298,6 +279,16 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    match agility::runtime_dir().map(|d| d.join("D3D12Core.dll")) {
+        Some(dll) if dll.exists() => println!(
+            "d3d12 sdk   : {} (version {})",
+            dll.display(),
+            agility::D3D12SDKVersion
+        ),
+        _ => println!(
+            "d3d12 sdk   : not beside the executable (needed on Windows 10: `cargo xtask agility`)"
+        ),
+    }
     println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));

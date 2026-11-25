@@ -54,6 +54,8 @@ This port checks every such record on the CPU first. Sane records run as fast as
 | `-Stats -Tag x` | log + memory curve to files |
 | `-Dred` | names the shader when the GPU hangs |
 
+**Windows 10** also works: run `cargo xtask agility` once (it fetches Microsoft's D3D12 Agility SDK, hash-checked) and keep the `D3D12` folder next to `victory.exe`. Windows 11 needs nothing.
+
 **Controls** · F9 mouse look · WASD move · Enter / Backspace / X / Y as A / B / X / Y · F10 overlay · F12 screenshot
 
 <br>
@@ -128,7 +130,7 @@ Needs Visual Studio Build Tools (MSVC + Windows SDK) and [rustup](https://rustup
 ## ◆ Credits
 
 **Traffic** &amp; **imgone** for Neptune, the base of this port.
-Built on Marvisak/VIctory · fxceless &amp; myokex (base, levels on demand, heap sync; PRs by Jonirulah, Flyander, AscilCH) · soldsawn (shader translator) · Belobug &amp; ShakiraRED-dt (ambient pass) · ZSlayerHQ · JoshuuDev · skornuta · Trexies · the DexNom FidelityFX patch. Full list in [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
+Built on Marvisak/VIctory · fxceless &amp; myokex (base, levels on demand, heap sync; PRs by Jonirulah, Flyander, AscilCH) · soldsawn (shader translator) · Belobug &amp; ShakiraRED-dt (ambient pass) · ZSlayerHQ · JoshuuDev · skornuta · Trexies · the DexNom FidelityFX patch · domints (Windows 10 Agility SDK loader, fxceless/victory-fork#402). Full list in [`docs/NEPTUNE-README.txt`](docs/NEPTUNE-README.txt).
 Port by **zm0kie**.
 
 <br>
