@@ -30,6 +30,7 @@ This port checks every such record on the CPU first. Sane records run as fast as
 |:--|:--|
 | **Console instructions** | The Xbox CPU is a Zen 2. Instructions Intel lacks (`MONITORX`, `MWAITX`, `CLZERO`, `INSERTQ`) have to be emulated on Intel. A Ryzen has them in hardware. |
 | **Indirect draws** | `VICTORY_INDIRECT_RAW=3` is the default: argument records are checked on the CPU before the GPU runs them. `-RawIndirect` brings back upstream's mode. |
+| **Water physics** | On by default: the ocean's height maps are copied back into game memory, so boats float and you can swim. `-NoOcean` turns it off. |
 | **32 GB RAM** | Upstream was tuned on 64 GB. `-Ram32` shrinks the list pool, the texture staging and the card copies. |
 
 <br>
@@ -85,6 +86,7 @@ Replace `D:\GTA6\...` with the path to **your** `game_scarlett_master.exe`.
 | `-Stats -Tag x` | writes `statsx.log` and `memwatchx.csv` next to the script, handy for bug reports |
 | `-Dred` | if the GPU hangs, the log names the shader that caused it |
 | `-NoAutoA` | do not tap A through the start screens automatically |
+| `-NoOcean` | turn off the water physics fix (boats sink) |
 | `-Env 'NAME=value;...'` | any extra `VICTORY_*` setting |
 
 Note: it is `-Warm`, one dash. `victory.exe warm` (no dash) does the same without starting the game.

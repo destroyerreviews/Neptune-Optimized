@@ -36,6 +36,7 @@ param(
   [switch]$Ram32,                                  # zm0kie: 32 GB PC profile (smaller pools)
   [string]$Env = '',                               # zm0kie: extra variables 'NAME=value;NAME2=value'
   [switch]$Dred,                                   # zm0kie: device-removed report (DRED breadcrumbs, page fault, per-command pipeline hashes)
+  [switch]$NoOcean,                                # zm0kie: no ocean read-back (boats sink, no swimming)
   [switch]$RawIndirect                             # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
 )
 if (-not (Test-Path -LiteralPath $Game)) { "Not found: $Game"; exit 1 }
@@ -148,6 +149,9 @@ if (-not $SeriesX) {
   }
 }
 $set['VICTORY_DISCORD'] = '0'
+# zm0kie: the ocean's height and displacement maps go back into title memory, so the game's
+# physics sees the water: boats float, you can swim (texback.rs, linear tile mode only).
+if (-not $NoOcean) { $set['VICTORY_OCEAN_READBACK'] = '1' }
 if ($Ram32) { $set['VICTORY_LIST_POOL_MB'] = '512'; $set['VICTORY_LIST_POOL_MOST'] = '1024'; $set['VICTORY_TEXTURE_STAGE_MB'] = '256'; $set['VICTORY_CARD_WINDOWS_MB'] = '3072' }
 foreach ($pair in ($Env -split ';')) { if ($pair -match '^\s*([A-Z0-9_]+)\s*=\s*(.*)$') { $set[$Matches[1]] = $Matches[2] } }
 if ($Dred) { $set['VICTORY_D3D12_DRED'] = '1' }
