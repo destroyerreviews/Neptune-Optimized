@@ -3581,6 +3581,15 @@ fn late_line(frames: f64) {
         );
     }
     if relay() {
+        let [pieces, commands] = READBACK_REGIONS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+        if pieces != 0 || commands != 0 {
+            tracing::info!(
+                "readback copy regions per frame: {:.1} logical pieces, {:.1} physical copy commands (coalesced {:.1})",
+                pieces as f64 / frames,
+                commands as f64 / frames,
+                pieces.saturating_sub(commands) as f64 / frames,
+            );
+        }
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
@@ -3661,6 +3670,42 @@ mod late_tests {
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
     }
 
+    #[test]
+    fn readback_coalesces_only_exactly_contiguous_regions() {
+        let mut out = Vec::new();
+        let counts = super::coalesce_readback([
+            (0, 0, 10, 100, 4),
+            (0, 0, 14, 104, 6),
+            (0, 0, 21, 110, 2), // source gap
+            (0, 0, 23, 113, 2), // destination gap
+            (1, 1, 25, 115, 4), // different resource
+            (1, 1, 29, 119, 1),
+            (1, 1, 0, 120, 3), // ring wrap
+            (1, 1, 3, 123, 0),
+        ], |s, src, dst, len| out.push((s, src, dst, len)));
+        assert_eq!(counts, (7, 5));
+        assert_eq!(out, [
+            (0, 10, 100, 10), (0, 21, 110, 2), (0, 23, 113, 2),
+            (1, 25, 115, 5), (1, 0, 120, 3),
+        ]);
+    }
+
+    #[test]
+    fn readback_empty_and_overlapping_regions() {
+        let mut out = Vec::new();
+        assert_eq!(super::coalesce_readback(
+            std::iter::empty::<((), usize, u64, u64, u64)>(),
+            |(), src, dst, len| out.push((src, dst, len)),
+        ), (0, 0));
+        assert!(out.is_empty());
+        assert_eq!(super::coalesce_readback([
+            ((), 0, 10, 20, 5),
+            ((), 0, 14, 25, 4),
+            ((), 0, 18, 28, 4),
+        ], |(), src, dst, len| out.push((src, dst, len))), (3, 3));
+        assert_eq!(out, [(10, 20, 5), (14, 25, 4), (18, 28, 4)]);
+    }
+
     /// Ranges are found by what they hold, not by where they start, and a
     /// range that only touches another's end does not touch it.
     #[test]
@@ -3688,6 +3733,56 @@ mod late_tests {
         }
         assert!(!touches(&[], 0, usize::MAX));
     }
+}
+
+/// Readback command counts, independently of the number of logical pieces
+/// fetched. Only physical copy commands are combined; merge metadata remains
+/// attached to every original piece.
+static READBACK_REGIONS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Emit maximal consecutive copy regions without changing order, source
+/// resource, destination offsets, or the bytes covered. The caller supplies
+/// a source identity unique within this batch and a handle to use for emission.
+/// Never bridge a gap, overlap, resource change, or ring wrap.
+fn coalesce_readback<T: Copy>(
+    regions: impl IntoIterator<Item = (T, usize, u64, u64, u64)>,
+    mut emit: impl FnMut(T, u64, u64, u64),
+) -> (u64, u64) {
+    let mut pending: Option<(T, usize, u64, u64, u64)> = None;
+    let (mut pieces, mut commands) = (0u64, 0u64);
+    for (source, key, src, dst, len) in regions {
+        if len == 0 {
+            continue;
+        }
+        pieces += 1;
+        if let Some((_, old_key, old_src, old_dst, old_len)) = pending.as_mut()
+            && *old_key == key
+            && old_src.checked_add(*old_len) == Some(src)
+            && old_dst.checked_add(*old_len) == Some(dst)
+            && let Some(combined) = old_len.checked_add(len)
+            && old_src.checked_add(combined).is_some()
+            && old_dst.checked_add(combined).is_some()
+        {
+            *old_len = combined;
+            continue;
+        }
+        if let Some((source, _, src, dst, len)) = pending.take() {
+            emit(source, src, dst, len);
+            commands += 1;
+        }
+        pending = Some((source, key, src, dst, len));
+    }
+    if let Some((source, _, src, dst, len)) = pending {
+        emit(source, src, dst, len);
+        commands += 1;
+    }
+    (pieces, commands)
+}
+
+fn readback_regions_count((pieces, commands): (u64, u64)) {
+    READBACK_REGIONS[0].fetch_add(pieces, Ordering::Relaxed);
+    READBACK_REGIONS[1].fetch_add(commands, Ordering::Relaxed);
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
@@ -5144,9 +5239,14 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (_, lo, hi, at, from, _) in &kept {
-                        list.CopyBufferRegion(&buffer, *at, snaps, *from, (*hi - *lo) as u64);
-                    }
+                    readback_regions_count(coalesce_readback(
+                        kept.iter().map(|(_, lo, hi, at, from, _)| {
+                            ((), 0, *from, *at, (*hi - *lo) as u64)
+                        }),
+                        |(), src, dst, len| {
+                            list.CopyBufferRegion(&buffer, dst, snaps, src, len);
+                        },
+                    ));
                     list.Close()?;
                     own.queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
                     own.queue.Signal(&own.fence, own.sent)?;
@@ -5176,9 +5276,14 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                    }
+                    readback_regions_count(coalesce_readback(
+                        pieces.iter().map(|(shadow, lo, hi, at)| {
+                            (shadow.as_ref(), Arc::as_ptr(shadow) as usize, *lo as u64, *at, (*hi - *lo) as u64)
+                        }),
+                        |shadow, src, dst, len| {
+                            list.CopyBufferRegion(&buffer, dst, &shadow.buffer, src, len);
+                        },
+                    ));
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     // In the order of the queue: the sends of title bytes so
