@@ -34,25 +34,76 @@ This port checks every such record on the CPU first. Sane records run as fast as
 
 <br>
 
-## ◆ Quick start
+## ◆ How to start
 
 > [!IMPORTANT]
 > No game files are included. You need your own copy of the game.
 
-```powershell
-# first launch: translates the shaders (~7 min), then starts the game
-.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Ram32 -Warm
+**1 · Get the files into one folder**
 
-# every launch after that
-.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Ram32
+```
+D:\Neptune\
+├─ victory.exe      ← build it (see Build below), or take it from Releases if one is published
+└─ play-zm.ps1      ← from tools\ in this repo
 ```
 
-| Switch | |
+**2 · Open PowerShell in that folder**
+
+In Explorer, open the folder, type `powershell` into the address bar and press Enter.
+If scripts are blocked, run this once for the window:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+```
+
+**3 · First start: translate the shaders**
+
+```powershell
+.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX -Warm
+```
+
+`-Warm` translates every shader of the game into the cache first (about 7 minutes, progress shows in PowerShell), then starts the game. You only need it once, and again after updating Neptune.
+
+**4 · Every start after that**
+
+```powershell
+.\play-zm.ps1 -Game 'D:\GTA6\game_scarlett_master.exe' -SeriesX
+```
+
+Replace `D:\GTA6\...` with the path to **your** `game_scarlett_master.exe`.
+
+<details>
+<summary><b>All switches</b></summary>
+<br>
+
+| Switch | Does |
 |:--|:--|
-| `-SeriesX` | 4K Series X path |
-| `-Ram32` | profile for 32 GB RAM |
-| `-Stats -Tag x` | log + memory curve to files |
-| `-Dred` | names the shader when the GPU hangs |
+| `-Game '<path>'` | your `game_scarlett_master.exe` |
+| `-Warm` | translate all shaders first (first start, and after updates) |
+| `-SeriesX` | 4K Series X path (recommended) |
+| `-Ram32` | smaller buffers for PCs with **32 GB** RAM (leave it out on 64 GB) |
+| `-Stats -Tag x` | writes `statsx.log` and `memwatchx.csv` next to the script, handy for bug reports |
+| `-Dred` | if the GPU hangs, the log names the shader that caused it |
+| `-NoAutoA` | do not tap A through the start screens automatically |
+| `-Env 'NAME=value;...'` | any extra `VICTORY_*` setting |
+
+Note: it is `-Warm`, one dash. `victory.exe warm` (no dash) does the same without starting the game.
+
+</details>
+
+<details>
+<summary><b>Something went wrong?</b></summary>
+<br>
+
+| Problem | Try |
+|:--|:--|
+| Script won't run | `Set-ExecutionPolicy -Scope Process Bypass`, then start again |
+| "Not found" | the `-Game` path is wrong, put it in single quotes |
+| Crash in `amdxc64.dll` | AMD driver issue, this port is tested on NVIDIA only. Update the driver, or use an AMD-focused fork |
+| Black or missing objects after an update | start once with `-Warm` |
+| Crash or freeze | run with `-Stats -Tag bug` and attach `statsbug.log` and `%LOCALAPPDATA%\victory\data\7952987A\crashes.log` to an issue |
+
+</details>
 
 **Windows 10** also works: run `cargo xtask agility` once (it fetches Microsoft's D3D12 Agility SDK, hash-checked) and keep the `D3D12` folder next to `victory.exe`. Windows 11 needs nothing.
 
