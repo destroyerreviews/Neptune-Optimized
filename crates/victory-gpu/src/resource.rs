@@ -1891,31 +1891,108 @@ fn oldest_covering(mut copies: Vec<(usize, u64, u64)>, need: u64) -> Vec<usize> 
     out
 }
 
+/// Experimental v2: use only the original unreferenced-texture retirement path.
+/// Never reset descriptor slots in this mode.
+#[cfg(windows)]
+fn adaptive_vram() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var("VICTORY_ADAPTIVE_VRAM").is_ok_and(|v| v == "1");
+        if enabled {
+            tracing::info!("adaptive VRAM v2: enabled (unreferenced copies only; slot eviction disabled)");
+        }
+        enabled
+    })
+}
+
+/// Trigger only when the actual local usage is high AND the queue's
+/// reserved-space admission line is reached. Cap additional retirement.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn adaptive_need(budget: u64, used: u64, reserved: u64, percent: u64, cap: u64) -> u64 {
+    if budget == 0 || used < budget / 100 * 80 {
+        return 0;
+    }
+    let line = budget / 100 * percent;
+    let accounted = used.saturating_add(reserved);
+    if accounted < line {
+        return 0;
+    }
+    accounted.saturating_sub(line).saturating_add(32 << 20).min(cap)
+}
+
+/// Select the oldest copies within a hard byte limit; skip zero-byte
+/// reserved/tiled copies and copies too large for the remaining allowance.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn adaptive_covering(mut copies: Vec<(usize, u64, u64)>, mut need: u64) -> Vec<usize> {
+    copies.sort_unstable_by_key(|&(at, stamp, _)| (stamp, at));
+    let mut out = Vec::new();
+    for (at, _, bytes) in copies {
+        if bytes != 0 && bytes <= need {
+            out.push(at);
+            need -= bytes;
+        }
+        if need == 0 {
+            break;
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+#[cfg(windows)]
+fn adaptive_idle_limits() -> (u64, u64) {
+    if adaptive_vram() { (1_500, 4) } else { (PRESSED_MS, PRESSED_FRAMES) }
+}
+
 /// The title textures to let go of under pressure ([`evict_percent`]),
 /// sorted by address: idle by the shorter measure and held by nothing but
 /// their title texture.
 #[cfg(windows)]
 fn pressure_victims(video: Option<[u64; 4]>) -> Vec<usize> {
     use std::sync::atomic::Ordering::Relaxed;
-    let (Some(percent), Some([budget, used, ..])) = (evict_percent(), video) else {
+    let Some([budget, used, ..]) = video else {
         return Vec::new();
     };
-    let need = excess(budget, used, percent);
+    let adaptive = adaptive_vram();
+    let need = if adaptive {
+        // Keep explicit texture-budget overrides authoritative.
+        if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() || room() {
+            return Vec::new();
+        }
+        adaptive_need(
+            budget, used,
+            targets_room_kept().saturating_add(crate::shadow::card_room_kept()),
+            room_percent(), 64 << 20,
+        )
+    } else {
+        let Some(percent) = evict_percent() else { return Vec::new(); };
+        excess(budget, used, percent)
+    };
     if need == 0 {
         return Vec::new();
     }
+    if adaptive {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::host::now_ms().saturating_add(1);
+        let last = LAST.load(Relaxed);
+        if (last != 0 && now.saturating_sub(last) < 1_000)
+            || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            return Vec::new();
+        }
+    }
+    let (idle_ms, idle_frames) = adaptive_idle_limits();
     let mut copies = Vec::new();
     for &at in textures().iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) {
+        if !fills(&r.desc) || (adaptive && crate::texture::host_wrote(at)) {
             continue;
         }
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref() {
             let stamp = r.host.used.load(Relaxed);
-            if crate::host::long_ago(stamp, PRESSED_MS, PRESSED_FRAMES)
+            if crate::host::long_ago(stamp, idle_ms, idle_frames)
                 && std::sync::Arc::strong_count(host) == 1
                 && crate::host::references(&host.texture) == 1
             {
@@ -1923,7 +2000,15 @@ fn pressure_victims(video: Option<[u64; 4]>) -> Vec<usize> {
             }
         }
     }
-    oldest_covering(copies, need)
+    if adaptive {
+        let eligible = copies.len();
+        let selected = adaptive_covering(copies, need);
+        tracing::info!(requested_mb = need >> 20, eligible, selected = selected.len(),
+            "adaptive VRAM v2: pressure scan");
+        selected
+    } else {
+        oldest_covering(copies, need)
+    }
 }
 
 /// Fills [`VRAM_KINDS`]: one pass over the title textures.
@@ -2013,6 +2098,8 @@ pub(crate) fn let_go_idle() {
     // Under pressure (`VICTORY_VRAM_EVICT`): the least recently used copies
     // that are idle by the shorter measure go, enough to get under it.
     let pressed = pressure_victims(video);
+    let pressure_idle = adaptive_idle_limits();
+    let (mut pressure_count, mut pressure_bytes) = (0u64, 0u64);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2028,7 +2115,12 @@ pub(crate) fn let_go_idle() {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 let (ms, frames) = if pressed.binary_search(&at).is_ok() {
-                    (PRESSED_MS, PRESSED_FRAMES)
+                    // Do not retire a copy that became larger than the
+                    // selected allowance between selection and removal.
+                    if adaptive_vram() && host.bytes > (64u64 << 20).saturating_sub(pressure_bytes) {
+                        return false;
+                    }
+                    pressure_idle
                 } else {
                     (idle_ms, IDLE_FRAMES)
                 };
@@ -2052,6 +2144,8 @@ pub(crate) fn let_go_idle() {
             if pressed.binary_search(&at).is_ok() {
                 EVICTED[0].fetch_add(1, Relaxed);
                 EVICTED[1].fetch_add(host.bytes, Relaxed);
+                pressure_count += 1;
+                pressure_bytes = pressure_bytes.saturating_add(host.bytes);
             }
             went += 1;
             bytes += host.bytes;
@@ -2061,7 +2155,16 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
-    slot_evict(video, idle_ms, IDLE_FRAMES);
+    // V1 entered the slot-reset path shortly before an access violation.
+    // V2 deliberately leaves every referenced texture alone.
+    if adaptive_vram() {
+        if !pressed.is_empty() {
+            tracing::info!(textures = pressure_count, retired_mb = pressure_bytes >> 20,
+                "adaptive VRAM v2: pressure retirement (GPU release may be deferred)");
+        }
+    } else {
+        slot_evict(video, idle_ms, IDLE_FRAMES);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -3270,6 +3373,18 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn adaptive_v2_requires_real_pressure_and_caps_retirement() {
+        let mb = 1u64 << 20;
+        assert_eq!(super::adaptive_need(0, 100, 100, 90, 64 * mb), 0);
+        assert_eq!(super::adaptive_need(1000 * mb, 700 * mb, 300 * mb, 90, 64 * mb), 0);
+        assert_eq!(super::adaptive_need(1000 * mb, 850 * mb, 49 * mb, 90, 64 * mb), 0);
+        assert_eq!(super::adaptive_need(1000 * mb, 850 * mb, 50 * mb, 90, 64 * mb), 32 * mb);
+        assert_eq!(super::adaptive_need(1000 * mb, 900 * mb, 100 * mb, 90, 64 * mb), 64 * mb);
+        assert_eq!(super::adaptive_covering(vec![(1, 1, 80), (2, 2, 0), (3, 3, 40), (4, 4, 24), (5, 5, 1)], 64), vec![3, 4]);
+        assert!(super::adaptive_covering(vec![(1, 1, 1)], 0).is_empty());
+    }
+
     #[test]
     fn slot_eviction_need_is_the_excess_capped_by_the_rate() {
         assert_eq!(super::slot_need(1000, 900, 80, 50), 50);
