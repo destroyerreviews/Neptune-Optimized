@@ -39,6 +39,9 @@ param(
   [switch]$RawIndirect                             # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
 )
 if (-not (Test-Path -LiteralPath $Game)) { "Not found: $Game"; exit 1 }
+# zm0kie: start clean. VICTORY_* variables left in this PowerShell window by other launchers
+# (e.g. VICTORY_BVH_BUILDER=1 from a ray-tracing test) would otherwise carry into this run.
+Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Remove-Item
 $set = [ordered]@{
   # settled
   VICTORY_CARD_WINDOWS_MB     = '4096'      # draw data on the card (16 GB card)
