@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -2469,6 +2469,20 @@ pub(crate) fn memory() -> [u64; 6] {
             .filter(|s| !s.transient() && !s.rebar)
             .map(|s| s.len)
             .sum();
+        if hybrid_windows() {
+            let logical: u64 = loose.keys().map(|&(_, len)| len).sum();
+            let unique = cover(loose.keys().copied());
+            let stats = HYBRID_STATS.each_ref().map(|n| n.load(Ordering::Relaxed));
+            tracing::info!(
+                weak_cache_inserts = stats[0], validated_weak_hits = stats[1],
+                weak_misses = stats[2], cross_cell_reuses = stats[3],
+                nominal_reuse_mb = stats[4] >> 20, compact_allocations = stats[5],
+                nominal_padding_avoided_mb = stats[6] >> 20,
+                logical_window_mb = logical >> 20, unique_title_range_mb = unique >> 20,
+                overlapping_window_mb = logical.saturating_sub(unique) >> 20,
+                "hybrid windows v6: logical coverage and cumulative reuse (not physical savings)"
+            );
+        }
         (seen.len() as u64, bytes)
     };
     let (kept, kept_bytes) = {
@@ -3850,10 +3864,79 @@ fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Ar
     LOOSE.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// V6 is opt-in. Do not retain a loose window merely because a recording
+/// thread last looked it up; dormant threads may keep that cache for the
+/// whole run. The ordinary buffer and descriptor lookup paths are preserved.
+fn hybrid_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HYBRID_WINDOWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("hybrid windows v6: non-owning window cache and covering-range reuse enabled");
+        }
+        on
+    })
+}
+
+/// Optional second experiment: shrink only known-length draw/indirect
+/// requests. Never change root-view extents or descriptor lookup identities.
+fn compact_draw_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| hybrid_windows() &&
+        std::env::var_os("VICTORY_COMPACT_DRAW_WINDOWS").is_some_and(|v| v == "1"))
+}
+
+/// Cumulative counts: weak cache inserts, validated weak hits, misses,
+/// cross-cell reuse, nominal bytes of allocations avoided by such reuse,
+/// compact allocations, nominal padding bytes avoided.
+static HYBRID_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+enum FoundCopy {
+    Owned(Arc<Shadow>),
+    Window { key: (u64, u64), identity: Weak<Shadow> },
+}
+
+impl FoundCopy {
+    fn new(shadow: &Arc<Shadow>) -> Self {
+        if hybrid_windows() && shadow.window {
+            HYBRID_STATS[0].fetch_add(1, Ordering::Relaxed);
+            Self::Window { key: shadow.span(), identity: Arc::downgrade(shadow) }
+        } else {
+            Self::Owned(shadow.clone())
+        }
+    }
+
+    fn get(&self, address: u64, len: u64) -> Option<Arc<Shadow>> {
+        match self {
+            Self::Owned(s) => Some(s.clone()),
+            Self::Window { key, identity } => {
+                let end = address.checked_add(len.max(1))?;
+                // Match lookup_tables' buffer priority. Take locks in the
+                // same order (BUFFERS then LOOSE). Never upgrade a weak
+                // reference outside the table lock: a sweep could already
+                // have decided that the copy is idle and remove it.
+                let buffers = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+                let same = |s: &Arc<Shadow>| identity.as_ptr() == Arc::as_ptr(s);
+                let result = if let Some((_, entry)) = buffers
+                    .range(..=(address, usize::MAX)).rev().take(64)
+                    .find(|(_, e)| e.end >= end)
+                {
+                    entry.shadow.as_ref().filter(|s| same(s)).cloned()
+                } else {
+                    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+                    loose.get(key).filter(|s| same(s)).cloned()
+                };
+                HYBRID_STATS[if result.is_some() { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+                result
+            }
+        }
+    }
+}
+
 thread_local! {
-    /// (Neptune) What this thread's look-ups found, while [`SHAPE`] stands: the count, and
-    /// the copy by (address, length, any).
-    static FOUND: std::cell::RefCell<(u64, std::collections::HashMap<(u64, u64, bool), Arc<Shadow>>)> =
+    /// Cache identity while SHAPE stands. V6 window entries do not own
+    /// their graphics resource, unlike the legacy entries.
+    static FOUND: std::cell::RefCell<(u64, std::collections::HashMap<(u64, u64, bool), FoundCopy>)> =
         std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new()));
 }
 
@@ -3873,7 +3956,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let shape = SHAPE.load(Ordering::Acquire);
     let hit = FOUND.with(|found| {
         let found = found.borrow();
-        (found.0 == shape).then(|| found.1.get(&(address, len, any)).cloned()).flatten()
+        (found.0 == shape).then(|| found.1.get(&(address, len, any)).and_then(|s| s.get(address, len))).flatten()
     });
     if let Some(shadow) = hit {
         // Still in use (what lets idle copies go looks at this).
@@ -3890,7 +3973,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 kept.1.clear();
                 kept.0 = shape;
             }
-            kept.1.insert((address, len, any), shadow.clone());
+            kept.1.insert((address, len, any), FoundCopy::new(shadow));
         });
     }
     found
@@ -4273,6 +4356,54 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// Choose the same window for descriptor and unsized requests as before.
+/// For find_any only, an existing window starting in an earlier cell may
+/// also hold the complete range. Limit the search to 32 entries so a miss
+/// never becomes a scan of the whole world. No new alias entries are made.
+fn draw_window_key<T>(
+    map: &BTreeMap<(u64, u64), T>,
+    address: u64,
+    end: u64,
+    cell: u64,
+    named: (u64, u64),
+    hybrid: bool,
+    compact: bool,
+) -> (u64, u64) {
+    let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+    if let Some(key) = holder(there, address, end) {
+        return key;
+    }
+    if hybrid {
+        let preceding = map.range(..(cell, 0)).rev().take(32).map(|(key, _)| *key);
+        if let Some(key) = holder(preceding, address, end) {
+            return key;
+        }
+    }
+    // A genuinely short, explicitly sized ask may use a smaller grid.
+    // Avoid splitting a request across two compact cells. Never use this
+    // policy for descriptor creation or for a root with unknown extent.
+    if compact && end.saturating_sub(address) <= 128 << 10 {
+        let key = window_of(address, end, 256 << 10);
+        if key.1 == 256 << 10 && key.1 < named.1 {
+            return key;
+        }
+    }
+    named
+}
+
+fn note_hybrid_window(key: (u64, u64), named: (u64, u64), cell: u64, reused: bool) {
+    if !hybrid_windows() {
+        return;
+    }
+    if reused && key.0 < cell {
+        HYBRID_STATS[3].fetch_add(1, Ordering::Relaxed);
+        HYBRID_STATS[4].fetch_add(named.1, Ordering::Relaxed);
+    } else if !reused && key.1 < named.1 {
+        HYBRID_STATS[5].fetch_add(1, Ordering::Relaxed);
+        HYBRID_STATS[6].fetch_add(named.1 - key.1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     {
         // (Neptune) The window is there already, the usual case: found and noted used beside
@@ -4284,12 +4415,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
             longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
         } else if any && fine() && !unsized_ask {
-            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-            holder(there, address, end).unwrap_or(named)
+            draw_window_key(&map, address, end, cell, named, hybrid_windows(), compact_draw_windows())
         } else {
             named
         };
         if let Some(shadow) = map.get(&(start, len)) {
+            if any && !unsized_ask {
+                note_hybrid_window((start, len), named, cell, true);
+            }
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
             shadow.asked[1].fetch_max(end, Ordering::Relaxed);
@@ -4306,11 +4439,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
     } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
+        draw_window_key(&map, address, end, cell, named, hybrid_windows(), compact_draw_windows())
     } else {
         named
     };
@@ -4324,6 +4453,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     if let Some(shadow) = map.get(&(start, len)) {
+        if any && !unsized_ask {
+            note_hybrid_window((start, len), named, cell, true);
+        }
         note(shadow);
         return Some(shadow.clone());
     }
@@ -4333,6 +4465,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        if any && !unsized_ask {
+            note_hybrid_window((start, len), named, cell, false);
+        }
         return Some(shadow);
     }
     // (Neptune) With `window_upload`, a window that gets a card side has no CPU side
@@ -4406,6 +4541,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    if any && !unsized_ask {
+        note_hybrid_window((start, len), named, cell, false);
+    }
     Some(shadow)
 }
 
@@ -4487,7 +4625,40 @@ pub(crate) fn exact_line(frames: f64) {
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, cover, draw_window_key, grid, holder, longest_tail, tail_of, window_of};
+
+    #[test]
+    fn hybrid_draw_reuses_only_a_window_covering_the_complete_range() {
+        let cell = 2 * WINDOW;
+        let ask = cell + 64 * 1024;
+        let end = ask + 64 * 1024;
+        let named = (cell, 1 << 20);
+        let mut map = std::collections::BTreeMap::new();
+        let partial = (cell - (1 << 20), (1 << 20) + 96 * 1024);
+        map.insert(partial, ());
+        assert_eq!(draw_window_key(&map, ask, end, cell, named, true, false), named);
+        let spanning = (cell - (1 << 20), 2 << 20);
+        map.insert(spanning, ());
+        assert_eq!(draw_window_key(&map, ask, end, cell, named, false, false), named);
+        assert_eq!(draw_window_key(&map, ask, end, cell, named, true, false), spanning);
+        map.insert(named, ());
+        assert_eq!(draw_window_key(&map, ask, end, cell, named, true, false), named);
+    }
+
+    #[test]
+    fn compact_draws_never_clip_a_request() {
+        let cell = 2 * WINDOW;
+        let named = (cell, 1 << 20);
+        let map = std::collections::BTreeMap::<(u64, u64), ()>::new();
+        let ask = cell + 64 * 1024;
+        assert_eq!(draw_window_key(&map, ask, ask + 32 * 1024, cell, named, true, true),
+            (cell, 256 * 1024));
+        let near_end = cell + 250 * 1024;
+        assert_eq!(draw_window_key(&map, near_end, near_end + 32 * 1024, cell, named, true, true),
+            named);
+        assert_eq!(draw_window_key(&map, ask, ask + 200 * 1024, cell, named, true, true), named);
+        assert_eq!(draw_window_key(&map, ask, ask + 32 * 1024, cell, named, true, false), named);
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
