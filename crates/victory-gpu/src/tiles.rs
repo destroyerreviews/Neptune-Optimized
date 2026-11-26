@@ -62,7 +62,7 @@ use crate::host::host;
 const TILE: u64 = 64 << 10;
 
 /// Experimental V4. Explicit opt-in; legacy mapping remains available.
-fn adaptive() -> bool {
+pub(crate) fn adaptive() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_ADAPTIVE_TEXTURES").is_some_and(|v| v == "1");
@@ -464,7 +464,11 @@ impl Tiled {
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         if adapt {
-            self.reclaim_absent(&mut given, queue, texture, named, room);
+            if let Some(retired) = self.reclaim_absent(&mut given, queue, texture, named, room,
+                |since| crate::host::long_ago(since, 3000, 4))
+            {
+                crate::host::retire(retired);
+            }
         }
         // Never grow the heap pool behind the closed texture gate, except
         // for the original mandatory GPU-written levels. Also respect an
@@ -488,7 +492,8 @@ impl Tiled {
         texture: &ID3D12Resource,
         held: u32,
         room: bool,
-    ) {
+        old_enough: impl Fn(u64) -> bool,
+    ) -> Option<PendingTiles> {
         let backed = self.every_level() & !self.without_locked(given, self.every_level());
         let now = crate::host::moment().max(1);
         let mut retired = Vec::new();
@@ -504,7 +509,7 @@ impl Tiled {
                 continue;
             }
             if room || !may_reclaim(level as u32, held, backed, given.ever_written,
-                crate::host::long_ago(since, 3000, 4))
+                old_enough(since))
             {
                 continue;
             }
@@ -538,9 +543,7 @@ impl Tiled {
             given.absent_since[level] = 0;
             ADAPTIVE_STATS[0].fetch_add(1, Ordering::Relaxed);
         }
-        if !retired.is_empty() {
-            crate::host::retire(PendingTiles(retired));
-        }
+        if retired.is_empty() { None } else { Some(PendingTiles(retired)) }
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -1620,6 +1623,61 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    fn absent_mip_returns_only_after_fence(rig: &mut Rig) {
+        rig.step = "V4: unmap an absent mip, wait for the fence, reuse and restore";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        if tiled.standard.is_empty() {
+            eprintln!("no standard mips for V4 test; skipped");
+            return;
+        }
+        let layout = rig.footprints(&desc);
+        let full = rig.filled(&layout, |level| level as u8 + 1);
+        let partial = rig.filled(&layout, |level| if level == 0 { 0 } else { level as u8 + 1 });
+        let mask = tiled.every_level();
+        let held = mask & !1;
+        tiled.uploaded_on(&rig.queue, &rig.device, &texture, mask, true);
+        assert!(tiled.whole());
+        rig.round_trip(&texture, &layout, Some(&full));
+        // First upload with the finer level absent hides it and writes zeros.
+        tiled.uploaded_on(&rig.queue, &rig.device, &texture, held, true);
+        rig.round_trip(&texture, &layout, Some(&partial));
+        let before = tiled.given_bytes();
+        let total = given_total();
+        let pending = {
+            let mut given = tiled.given.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(tiled.reclaim_absent(&mut given, &rig.queue, &texture, held, false, |_| true).is_none());
+            tiled.reclaim_absent(&mut given, &rig.queue, &texture, held, false, |_| true)
+                .expect("second observation of absent standard mip")
+        };
+        assert_eq!(given_total(), total, "retired runs cannot be reused yet");
+        assert!(!tiled.has_tiles(0));
+        let bytes = before - tiled.given_bytes();
+        assert_eq!(bytes, u64::from(tiled.standard[0]) * TILE);
+        let read = rig.round_trip(&texture, &layout, None);
+        assert!(all(&read[0], 0), "unmapped mip must read zero");
+        for (i, data) in read.iter().enumerate().skip(1) {
+            assert!(all(data, i as u8 + 1), "lower detail mip changed");
+        }
+        // The rig's round trip waited on its fence. Only now return runs.
+        drop(pending);
+        assert_eq!(given_total(), total - bytes);
+        // Existing pool tiles may be reused without allocating another heap.
+        let pool_bytes = STATS[3].load(Ordering::Relaxed);
+        tiled.uploaded_impl(&rig.queue, &rig.device, &texture, mask, false, true);
+        assert!(tiled.has_tiles(0), "a previously freed mip should be reusable");
+        assert_eq!(STATS[3].load(Ordering::Relaxed), pool_bytes);
+        let read = rig.round_trip(&texture, &layout, Some(&full));
+        for (i, data) in read.iter().enumerate() {
+            assert!(all(data, i as u8 + 1), "restored mip has wrong contents");
+        }
+        // A GPU-write recording protects a previously resident texture.
+        assert_eq!(tiled.claim(1), 0);
+        let mut given = tiled.given.lock().unwrap_or_else(|e| e.into_inner());
+        given.absent_since[0] = 1;
+        assert!(tiled.reclaim_absent(&mut given, &rig.queue, &texture, held, false, |_| true).is_none());
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1636,6 +1694,11 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        // Do not change global env vars for the no-growth test: a caller
+        // may have supplied a logical texture-byte cap.
+        if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_none() {
+            absent_mip_returns_only_after_fence(&mut rig);
+        }
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
