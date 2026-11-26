@@ -1959,6 +1959,19 @@ impl State {
             }
             None => (span, per_frame),
         };
+        // V5: throttle only this background bindless texture pass while
+        // physical RAM or commit headroom is low. The normal draw/table
+        // upload path remains unchanged. This ceiling also bounds catch-up
+        // and early passes, rather than allowing them to override it.
+        // SPENT is accounted after staging, as before: one texture can
+        // cross the ceiling and already-recorded work is never cancelled.
+        let (span, bytes_at_most) = match crate::host::memory_pressure().speculative_limits() {
+            Some((bytes, ms)) => (
+                span.min(std::time::Duration::from_millis(ms)),
+                bytes_at_most.min(bytes),
+            ),
+            None => (span, bytes_at_most),
+        };
         let began = std::time::Instant::now();
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
