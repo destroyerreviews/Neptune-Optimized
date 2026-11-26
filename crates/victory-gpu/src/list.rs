@@ -288,6 +288,53 @@ fn stale(pushed_at: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usize 
     pushed_at.take_while(|&t| now.saturating_sub(t) > max_age).count()
 }
 
+/// V5: shrink only the surplus of completed, idle host lists. Their D3D12
+/// command allocators and auxiliary buffers can retain substantial storage
+/// even when scratch_kept() is zero. Retain the newest lists for reuse;
+/// age and a bounded batch prevent destroying the next frame's working set.
+#[cfg(windows)]
+fn pressure_trim_count(pushed_at: &[u64], now: u64, keep: usize, age: u64, batch: usize) -> usize {
+    stale(pushed_at.iter().copied(), now, age)
+        .min(pushed_at.len().saturating_sub(keep))
+        .min(batch)
+}
+
+#[cfg(windows)]
+pub(crate) fn trim_idle_pressure() {
+    use crate::host::RamPressure;
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::host::memory_governor_on() || !pools() {
+        return;
+    }
+    let pressure = crate::host::memory_pressure();
+    let (keep, age, batch) = match pressure {
+        RamPressure::Normal => (256, 30_000, 8),
+        RamPressure::High => (128, 5_000, 16),
+        RamPressure::Critical => (64, 2_000, 32),
+    };
+    let now = crate::host::now_ms();
+    let (gone, remaining, upload_bytes) = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let ages: Vec<_> = idle.0.iter().map(|i| i.2).collect();
+        let n = pressure_trim_count(&ages, now, keep, age, batch);
+        if n == 0 {
+            return;
+        }
+        let gone: Vec<_> = idle.0.drain(..n).collect();
+        let bytes = gone.iter().map(|i| i.1).sum::<u64>();
+        idle.1 -= bytes;
+        (gone, idle.0.len(), bytes)
+    };
+    let n = gone.len();
+    // Completed lists only; drop outside the pool lock.
+    drop(gone);
+    TRIMMED_LISTS.fetch_add(n as u64, Relaxed);
+    tracing::info!(
+        ?pressure, trimmed_lists = n, remaining, upload_mb = upload_bytes >> 20,
+        "memory governor v5: idle command lists released (driver allocator bytes unknown)"
+    );
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -2337,6 +2384,17 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn pressure_trim_preserves_recent_and_minimum_pool() {
+        let ages = [0, 100, 200, 300, 4900, 4950];
+        assert_eq!(pressure_trim_count(&ages, 5000, 2, 2000, 16), 4);
+        assert_eq!(pressure_trim_count(&ages, 5000, 4, 2000, 16), 2);
+        assert_eq!(pressure_trim_count(&ages, 5000, 2, 2000, 1), 1);
+        assert_eq!(pressure_trim_count(&ages, 5000, 6, 2000, 16), 0);
+        assert_eq!(pressure_trim_count(&ages, 5000, 2, 6000, 16), 0);
+    }
 
     #[test]
     fn only_the_oldest_idle_lists_are_stale() {
