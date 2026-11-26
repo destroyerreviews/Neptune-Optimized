@@ -38,10 +38,12 @@
 //!   that is held and has tiles ([`show_from`], `descriptor/host.rs`
 //!   `make`), and the slots of a texture are made again when that level
 //!   changes (`HostHeap::texture_views_remade`).
-//! - shortcut: tiles are not taken back while the host copy lives. A level
-//!   the title lets go of, or that turns out to be the next texture's,
-//!   keeps its tiles; it is hidden by the views and written with zeros at
-//!   the next upload. Its tiles go back when the host copy does.
+//! - By default tiles are not taken back while the host copy lives.
+//!   VICTORY_ADAPTIVE_TEXTURES=1 permits reclaiming standard mips already
+//!   hidden and observed absent on later uploads under pressure. Mips of
+//!   textures with recorded GPU writes and the packed tail are protected.
+//!   Null mappings are submitted on the graphics queue and backing tiles
+//!   are returned only after the submission fence has completed.
 //!
 //! Only for a texture the title places in memory and fills, two-dimensional,
 //! one layer, more than one level, of [`floor`] bytes or more, whose memory
@@ -58,6 +60,32 @@ use crate::host::host;
 
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
+
+/// Experimental V4. Explicit opt-in; legacy mapping remains available.
+fn adaptive() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ADAPTIVE_TEXTURES").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("adaptive textures v4: coarse-first, existing-heap reuse and fenced absent-mip reclamation enabled");
+        }
+        on
+    })
+}
+
+/// Reclaimed levels, retired tile bytes, and bytes reused without growing
+/// a heap while the general texture gate was closed.
+static ADAPTIVE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Do not unmap a mip at or below the first held level, nor any resource
+/// for which a GPU write has been recorded. Packed mips are never passed
+/// here. Require a second observation with the previous upload's absent
+/// mip still absent, already hidden from the normal sampled views.
+fn may_reclaim(level: u32, held: u32, backed: u32, written: bool, old_enough: bool) -> bool {
+    !written && old_enough && held != 0 && (held & backed) != 0
+        && level < held.trailing_zeros()
+        && backed & (1u32 << level) != 0
+}
 
 /// Tiles in one heap of the pool (64 MiB). The largest level given is a
 /// 4096x4096 one of one byte a texel: 256 tiles.
@@ -151,7 +179,12 @@ static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 /// tiles first (single free tiles are used up before a long run is cut):
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
 /// heap is made when no heap has that many free.
+#[cfg(test)]
 fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
+    take_with_growth(device, count, true)
+}
+
+fn take_with_growth(device: &ID3D12Device, count: u32, grow: bool) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
     if count == 0 || count > HEAP_TILES {
         return None;
     }
@@ -160,6 +193,11 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let index = match found {
         Some(index) => index,
         None => {
+            // The heap is the actual GPU allocation. Existing free runs
+            // do not need another heap, even when the general gate closes.
+            if !grow {
+                return None;
+            }
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: u64::from(HEAP_TILES) * TILE,
                 Properties: D3D12_HEAP_PROPERTIES {
@@ -237,14 +275,48 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     }
 }
 
+/// Per-level ownership. The packed mip group is identified by the first
+/// packed subresource number, so it remains one indivisible mapping.
+type Run = (u32, usize, u32, u32);
+
+/// Backing tiles awaiting the graphics submission's completion. The pool
+/// still owns the heaps and does not expose these runs until Drop.
+struct PendingTiles(Vec<Run>);
+
+impl Drop for PendingTiles {
+    fn drop(&mut self) {
+        let bytes = return_runs(&self.0);
+        STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        ADAPTIVE_STATS[1].fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+fn return_runs(runs: &[Run]) -> u64 {
+    let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+    let mut bytes = 0u64;
+    for &(_, index, start, tiles) in runs {
+        by_heap.entry(index).or_default().push((start, tiles));
+        bytes += u64::from(tiles) * TILE;
+    }
+    for (index, runs) in by_heap {
+        give_back(index, &runs);
+    }
+    bytes
+}
+
 /// What is given so far to one texture.
 struct Given {
     /// Per level with tiles of its own: whether it has them.
     levels: Vec<bool>,
     /// Whether the small levels the card packs together have theirs.
     packed: bool,
-    /// The runs taken: the heap's place, first tile, tiles.
-    runs: Vec<(usize, u32, u32)>,
+    /// The runs taken: subresource, heap's place, first tile, tiles.
+    runs: Vec<Run>,
+    /// Sticky, including writes recorded but not yet submitted. A write
+    /// recorded while a mip is backed may not have a zero initialization.
+    ever_written: bool,
+    /// First upload that observed a backed standard mip no longer held.
+    absent_since: [u64; 16],
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -328,6 +400,8 @@ impl Tiled {
                 levels: vec![false; standard.len()],
                 packed: false,
                 runs: Vec::new(),
+                ever_written: false,
+                absent_since: [0; 16],
             }),
             standard,
             packed: packed_tiles,
@@ -357,12 +431,13 @@ impl Tiled {
     /// the level would stay empty until the title writes the texture.
     pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
+            Some(host) => self.uploaded_impl(host.queue(), &host.device, texture, held, room, adaptive()),
             None => (false, false),
         }
     }
 
     /// [`Tiled::uploaded`] on a queue and a device.
+    #[cfg(test)]
     pub(crate) fn uploaded_on(
         &self,
         queue: &ID3D12CommandQueue,
@@ -371,16 +446,101 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        self.uploaded_impl(queue, device, texture, held, room, false)
+    }
+
+    fn uploaded_impl(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+        adapt: bool,
+    ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
-        // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        if adapt {
+            self.reclaim_absent(&mut given, queue, texture, named, room);
+        }
+        // Never grow the heap pool behind the closed texture gate, except
+        // for the original mandatory GPU-written levels. Also respect an
+        // explicit user cap on logical texture bytes.
+        let reuse = adapt && std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_none();
+        let grow = if room { named } else { card };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, grow, reuse, adapt);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
+    }
+
+    /// Only called in the host's serialized submission step. Its submission
+    /// number has been incremented before the step, so host::retire waits
+    /// for the fence after these NULL mappings. An absent mip was hidden
+    /// and zeroed by the earlier complete upload; preserve a backed lower
+    /// detail mip and never remove a mip at or below the first held one.
+    fn reclaim_absent(
+        &self,
+        given: &mut Given,
+        queue: &ID3D12CommandQueue,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+    ) {
+        let backed = self.every_level() & !self.without_locked(given, self.every_level());
+        let now = crate::host::moment().max(1);
+        let mut retired = Vec::new();
+        for level in 0..self.standard.len() {
+            let bit = 1u32 << level;
+            if held & bit != 0 || !given.levels[level] {
+                given.absent_since[level] = 0;
+                continue;
+            }
+            let since = given.absent_since[level];
+            if since == 0 {
+                given.absent_since[level] = now;
+                continue;
+            }
+            if room || !may_reclaim(level as u32, held, backed, given.ever_written,
+                crate::host::long_ago(since, 3000, 4))
+            {
+                continue;
+            }
+            let tiles = self.standard[level];
+            let at = D3D12_TILED_RESOURCE_COORDINATE { X: 0, Y: 0, Z: 0, Subresource: level as u32 };
+            let size = D3D12_TILE_REGION_SIZE { NumTiles: tiles, ..Default::default() };
+            let flag = D3D12_TILE_RANGE_FLAG_NULL;
+            let began = std::time::Instant::now();
+            // SAFETY: the live reserved resource and one complete standard
+            // subresource. A NULL range does not reference a heap. The queue
+            // orders the mapping after previous work, and tiles are not
+            // recycled until the fence covering this submission has landed.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture, 1, Some(&raw const at), Some(&raw const size),
+                    None::<&ID3D12Heap>, 1, Some(&raw const flag), None,
+                    Some(&raw const tiles), D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            given.runs.retain(|run| {
+                if run.0 == level as u32 {
+                    retired.push(*run);
+                    false
+                } else {
+                    true
+                }
+            });
+            given.levels[level] = false;
+            given.absent_since[level] = 0;
+            ADAPTIVE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        }
+        if !retired.is_empty() {
+            crate::host::retire(PendingTiles(retired));
+        }
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -407,6 +567,7 @@ impl Tiled {
     ) -> bool {
         let levels = levels & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        given.ever_written = true;
         let prev = self.card.load(Ordering::Relaxed);
         let changed = self.give_locked(
             &mut given,
@@ -415,6 +576,8 @@ impl Tiled {
             texture,
             prev | levels | self.held.load(Ordering::Relaxed),
             levels,
+            false,
+            false,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
@@ -448,7 +611,11 @@ impl Tiled {
     /// zeros before the card's own write, so that what the write does not
     /// cover is not what the tiles' last owner left.
     pub(crate) fn claim(&self, levels: u32) -> u32 {
-        let fresh = self.without(levels);
+        // Mark writes while holding the same lock used for reclamation,
+        // before deciding whether their list must record initialization.
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        given.ever_written = true;
+        let fresh = self.without_locked(&given, levels);
         fresh & !self.claimed.fetch_or(fresh, Ordering::Relaxed)
     }
 
@@ -504,7 +671,7 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, false, false)
     }
 
     fn give_locked(
@@ -515,9 +682,12 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        reuse: bool,
+        coarse_first: bool,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
-        let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
+        let grow = |level: u32| level < 32 && named & may & (1 << level) != 0;
+        let now = |level: u32| has(level) && (reuse || grow(level));
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
@@ -529,10 +699,22 @@ impl Tiled {
         if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
             wanted.push((first_packed, self.packed, None));
         }
+        if coarse_first {
+            // Allocate small/packed mips before large ones. The full
+            // upload initializes all levels which receive tiles.
+            wanted.sort_unstable_by_key(|&(subresource, _, _)| std::cmp::Reverse(subresource));
+        }
         for (subresource, tiles, level) in wanted {
-            let Some((heap, index, runs)) = take(device, tiles) else {
+            let can_grow = match level {
+                Some(_) => grow(subresource),
+                None => (first_packed..self.levels).any(grow),
+            };
+            let Some((heap, index, runs)) = take_with_growth(device, tiles, can_grow) else {
                 continue;
             };
+            if !can_grow {
+                ADAPTIVE_STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+            }
             let at = D3D12_TILED_RESOURCE_COORDINATE {
                 X: 0,
                 Y: 0,
@@ -574,7 +756,7 @@ impl Tiled {
                 None => given.packed = true,
             }
             for &(start, count) in &runs {
-                given.runs.push((index, start, count));
+                given.runs.push((subresource, index, start, count));
             }
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
@@ -623,22 +805,14 @@ impl Tiled {
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+        given.runs.iter().map(|run| u64::from(run.3) * TILE).sum()
     }
 }
 
 impl Drop for Tiled {
     fn drop(&mut self) {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
-        let mut bytes = 0;
-        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
-            by_heap.entry(index).or_default().push((start, tiles));
-            bytes += u64::from(tiles) * TILE;
-        }
-        for (index, runs) in by_heap {
-            give_back(index, &runs);
-        }
+        let bytes = return_runs(&given.runs);
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
         STATS[2].fetch_sub(bytes, Ordering::Relaxed);
@@ -689,6 +863,17 @@ pub(crate) fn status() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     if s[4] == 0 {
         return;
+    }
+    if adaptive() {
+        let free: u64 = POOL.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten()
+            .map(|h| u64::from(h.free_tiles()) * TILE).sum();
+        tracing::info!(
+            reclaimed_levels = ADAPTIVE_STATS[0].load(Ordering::Relaxed),
+            reclaimed_mb = ADAPTIVE_STATS[1].load(Ordering::Relaxed) >> 20,
+            reused_while_full_mb = ADAPTIVE_STATS[2].load(Ordering::Relaxed) >> 20,
+            free_pool_mb = free >> 20,
+            "adaptive textures v4: fenced reclamation and heap reuse totals"
+        );
     }
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
@@ -1564,6 +1749,8 @@ void look() {
                 levels: vec![false, false],
                 packed: false,
                 runs: Vec::new(),
+                ever_written: false,
+                absent_since: [0; 16],
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
@@ -1583,5 +1770,21 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+    #[test]
+    fn only_reclaims_absent_finer_mips_with_backed_fallback() {
+        assert!(may_reclaim(0, 0b1100, 0b1101, false, true));
+        assert!(!may_reclaim(2, 0b1100, 0b1101, false, true));
+        assert!(!may_reclaim(0, 0b1100, 0b0001, false, true));
+        assert!(!may_reclaim(0, 0, 0b0001, false, true));
+        assert!(!may_reclaim(0, 0b1100, 0b1101, true, true));
+        assert!(!may_reclaim(0, 0b1100, 0b1101, false, false));
+        assert!(!may_reclaim(0, 0b1100, 0b1100, false, true));
+        assert!(!may_reclaim(2, 0b1001, 0b1101, false, true));
     }
 }
