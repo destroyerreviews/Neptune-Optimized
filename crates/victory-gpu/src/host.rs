@@ -145,6 +145,84 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// V5: one pressure decision shared by the speculative texture pass and
+/// the idle command-list pool. It is not a limit on the title's memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RamPressure {
+    Normal,
+    High,
+    Critical,
+}
+
+fn pressure_for(previous: RamPressure, total: u64, free: u64, commit: u64) -> RamPressure {
+    const MIB: u64 = 1 << 20;
+    let high = (total / 8).clamp(1536 * MIB, 4096 * MIB);
+    let critical = (total / 24).clamp(768 * MIB, 2048 * MIB);
+    // Hysteresis: don't toggle while a freed allocation or a new upload
+    // moves the system around a threshold.
+    if free < critical || commit < 1536 * MIB
+        || previous == RamPressure::Critical && (free < critical + 512 * MIB || commit < 2048 * MIB)
+    {
+        RamPressure::Critical
+    } else if free < high || commit < 3072 * MIB
+        || previous != RamPressure::Normal && (free < high + 512 * MIB || commit < 4096 * MIB)
+    {
+        RamPressure::High
+    } else {
+        RamPressure::Normal
+    }
+}
+
+pub(crate) fn memory_governor_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_GOVERNOR").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn memory_pressure() -> RamPressure {
+    if !memory_governor_on() {
+        return RamPressure::Normal;
+    }
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static LAST: Mutex<Option<(u64, RamPressure)>> = Mutex::new(None);
+    let now = now_ms();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, pressure)) = *last {
+        if now.saturating_sub(at) < 1000 {
+            return pressure;
+        }
+    }
+    let previous = last.map_or(RamPressure::Normal, |(_, p)| p);
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: the OS writes a correctly sized local structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        *last = Some((now, previous));
+        return previous;
+    }
+    let pressure = pressure_for(previous, m.ullTotalPhys, m.ullAvailPhys, m.ullAvailPageFile);
+    if last.is_none() || pressure != previous {
+        tracing::info!(
+            ?pressure, total_mb = m.ullTotalPhys >> 20, free_mb = m.ullAvailPhys >> 20,
+            commit_headroom_mb = m.ullAvailPageFile >> 20,
+            "memory governor v5: pressure state"
+        );
+    }
+    *last = Some((now, pressure));
+    pressure
+}
+
+impl RamPressure {
+    /// Ceiling on background staging work, not the allocator for required
+    /// textures. High/critical pressure still allows progress each frame.
+    pub(crate) fn speculative_limits(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Normal => None,
+            Self::High => Some((128 << 20, 100)),
+            Self::Critical => Some((64 << 20, 60)),
+        }
+    }
+}
+
 /// The host device's adapter name and dedicated video memory, when DXGI
 /// named it (the frametime dump's hardware line).
 pub(crate) fn adapter_summary() -> Option<(String, u64)> {
@@ -297,6 +375,7 @@ fn sweep() {
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::windowup::trim_idle();
+    crate::list::trim_idle_pressure();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -9506,5 +9585,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod memory_governor_tests {
+    use super::*;
+    #[test]
+    fn pressure_is_relative_to_ram_and_has_hysteresis() {
+        const G: u64 = 1 << 30;
+        const M: u64 = 1 << 20;
+        use RamPressure::*;
+        assert_eq!(pressure_for(Normal, 32*G, 3*G, 8*G), High);
+        assert_eq!(pressure_for(Normal, 16*G, 3*G, 8*G), Normal);
+        assert_eq!(pressure_for(Normal, 32*G, G, 8*G), Critical);
+        assert_eq!(pressure_for(Critical, 32*G, G + 512*M, 8*G), Critical);
+        assert_eq!(pressure_for(High, 32*G, 4*G, 8*G), High);
+        assert_eq!(pressure_for(High, 32*G, 5*G, 8*G), Normal);
+        assert_eq!(pressure_for(Normal, 64*G, 20*G, G), Critical);
+        assert_eq!(Critical.speculative_limits(), Some((64*M, 60)));
+        assert_eq!(Normal.speculative_limits(), None);
     }
 }
